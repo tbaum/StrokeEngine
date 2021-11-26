@@ -45,6 +45,7 @@ Stroker.setPattern(int index, bool applyNow);          // Pattern, index must be
   - All pattern updated accordingly. 
   - Also fixed the erratic move bug. When depth changes the necessary transfer motion is carried out at the same speed as the overall motion.
 - Some minor default parameter changes in the example code snippets.
+- Added set & get function to alter speed and acceleration limits during runtime.
 
 ## Update Notes
 ### Homing Procedure

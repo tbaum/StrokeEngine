@@ -30,7 +30,10 @@ void StrokeEngine::begin(machineGeometry *physics, motorProperties *motor) {
     _timeOfStroke = 1.0;
     _sensation = 0.0;
 
-    // Setup FastAccelStepper 
+    // Create message queue for streaming
+    _queueStreamingHandle = xQueueCreate(STREAMING_QUEUE_LENGHT, sizeof(streamingSegment));
+
+    // Setup FastAccelStepper
     engine.init();
     servo = engine.stepperConnectToPin(_motor->stepPin);
     if (servo) {
@@ -313,9 +316,56 @@ bool StrokeEngine::startPattern() {
     }
 }
 
+bool StrokeEngine::startStreaming() {
+    // Only valid if state is ready
+    if (_state == READY || _state == SETUPDEPTH) {
+
+        // Stop current move, should one be pending (moveToMax or moveToMin)
+        if (servo->isRunning()) {
+            // Stop servo motor as fast as legally allowed
+            servo->setAcceleration(_maxStepAcceleration);
+            servo->applySpeedAcceleration();
+            servo->stopMove();
+        }
+
+        _state = STREAMING;
+
+        if (_taskStreamingHandle == NULL) {
+            // Create Stroke Task
+            xTaskCreatePinnedToCore(
+                    this->_streamingImpl,   // Function that should be called
+                    "Streaming",            // Name of the task (for debugging)
+                    10000,                  // Stack size (bytes)
+                    this,                   // Pass reference to this class instance
+                    24,                     // Pretty high task piority
+                    &_taskStreamingHandle,  // Task handle
+                    1                       // Pin to application core
+            );
+        } else {
+            // Resume task, if it already exists
+            vTaskResume(_taskStreamingHandle);
+        }
+
+#ifdef DEBUG_TALKATIVE
+        Serial.println("Started streaming task");
+        Serial.println("Stroke Engine State: " + verboseState[_state]);
+#endif
+
+        return true;
+
+    } else {
+
+#ifdef DEBUG_TALKATIVE
+        Serial.println("Failed to start streaming");
+#endif
+        return false;
+
+    }
+}
+
 void StrokeEngine::stopMotion() {
-    // only valid when 
-    if (_state == PATTERN || _state == SETUPDEPTH) {
+    // only valid when
+    if (_state == PATTERN || _state == SETUPDEPTH || _state == STREAMING) {
         // Set state
         _state = READY;
 
@@ -590,6 +640,27 @@ void StrokeEngine::registerTelemetryCallback(void(*callbackTelemetry)(float, flo
     _callbackTelemetry = callbackTelemetry;
 }
 
+bool StrokeEngine::sendPositionToQueue(int targetPosition, int timeInMS) {
+    // copy function parameters into streamingSegment struct
+    static streamingSegment tempStreamingSegment;
+    // constrain relative position into valid range [0, 4096]
+    tempStreamingSegment.targetPos = constrain(targetPosition, 0, 4096);
+    tempStreamingSegment.timeToTarget = timeInMS;
+
+    // send to queue and return true on success
+    if (xQueueSend(_queueStreamingHandle, (void*) &tempStreamingSegment, 0) == pdTRUE) {
+        return true;
+    } else {
+        // return false if queue is full
+        return false;
+    };
+}
+
+void StrokeEngine::emptyStreamingQueue() {
+    //Reset queue to empty all elements
+    xQueueReset(_queueStreamingHandle);
+}
+
 void StrokeEngine::_homingProcedure() {
     // Set feedrate for homing
     servo->setSpeedInHz(_homeingSpeed);       
@@ -751,15 +822,65 @@ void StrokeEngine::_stroking() {
 }
 
 void StrokeEngine::_streaming() {
+    streamingSegment tempStreamingSegment;
+    int mappedStroke = 0;       // Intermediate variable to map relative position to stroke in steps
+    int targetStepPosition = 0; // Absolut position where to go
+    int lastStepPosition = 0;   // Where we are currently
+    int travelDistance = 0;     // Number of steps it takes to get to target
+    int ticksForEveryStep = 0;  // processor ticks needed between steps a.k.a counter compare value
+    // tempStreamingSegment.timeToTarge: time in ms it takes to get to target
 
     while(1) { // infinite loop
 
         // Suspend task, if not in STREAMING state
         if (_state != STREAMING) {
+            // empty streaming queue, so it is prepared for the next time
+            emptyStreamingQueue();
+
             vTaskSuspend(_taskStreamingHandle);
         }
         
-        // Delay 10ms 
+        // Consume element from streaming queue
+        if (xQueueReceive(_queueStreamingHandle, &tempStreamingSegment, 0)) {
+
+            // Last target position will be the starting point for this segment
+            lastStepPosition = targetStepPosition;
+
+            // Calculate real world step coordinates of next target
+            // map relative streaming position to stroke
+            mappedStroke = map(tempStreamingSegment.targetPos, 0, 4096, 0, _stroke);
+
+            // apply _depth offset and constrain to range
+            targetStepPosition = constrain(((_depth - _stroke) + mappedStroke), _minStep, _maxStep);
+
+            // actual travel distance in steps for this segment
+            travelDistance = targetStepPosition - lastStepPosition;
+
+            // Perform speed boundary check
+            if ((abs(travelDistance * 1000) / tempStreamingSegment.timeToTarget) > _maxStepPerSecond) {
+                // adjust target position to obey speed limit
+                travelDistance = sgn(travelDistance) * (_maxStepPerSecond * tempStreamingSegment.timeToTarget) / 1000;
+                targetStepPosition = lastStepPosition + travelDistance;
+            }
+
+            // Calculate ticks needed to creat correct speed signal
+            ticksForEveryStep = (tempStreamingSegment.timeToTarget * TICKS_PER_S / 1000) / abs(travelDistance);
+
+        } else {
+            // error handling for empty queue
+        };
+
+
+        // deal with slow speeds because of 16bit counter width of ESP32
+        if (ticksForEveryStep > 0x10000) {
+            // insert pauses
+        } else {
+            // just fill queue
+            struct stepper_command_s cmd = {
+                .ticks = ticksForEveryStep, .steps = travelDistance, .count_up = (travelDistance < 0) ? false : true};
+        }
+
+        // Delay 10ms
         vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
@@ -840,10 +961,10 @@ void StrokeEngine::_setupDepths() {
 
     // Send telemetry data
     if (_callbackTelemetry != NULL) {
-        _callbackTelemetry(float(depth / _motor->stepsPerMillimeter), 
-            float(servo->getSpeedInMilliHz() * 1000 / _motor->stepsPerMillimeter), 
+        _callbackTelemetry(float(depth / _motor->stepsPerMillimeter),
+            float(servo->getSpeedInMilliHz() * 1000 / _motor->stepsPerMillimeter),
             false);
-    } 
+    }
 
 #ifdef DEBUG_TALKATIVE
     Serial.println("setup new depth: " + String(depth));
